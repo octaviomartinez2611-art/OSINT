@@ -1,0 +1,563 @@
+# OSINT ARGENTINA - ARCHIVO UNICO
+# Este es el unico archivo. Contiene el workflow de GitHub y, adentro, todo el codigo y la pagina.
+#
+# PASOS (en este orden):
+#   1. Crear un repositorio PUBLICO en GitHub (github.com/new).
+#   2. En el repo: Settings > Pages > Source: elegir "GitHub Actions".
+#   3. En el repo: Add file > Create new file. En el nombre escribir exactamente
+#        .github/workflows/publicar.yml
+#      pegar TODO este archivo y apretar "Commit changes".
+#   4. Pestaña Actions: esperar el tilde verde (unos minutos). La pagina queda en
+#        https://TU_USUARIO.github.io/NOMBRE_DEL_REPO/
+#      Despues se actualiza sola cada 6 horas.
+# Si "publicar" sale en rojo es porque faltaba el paso 2: hacerlo y apretar "Re-run all jobs".
+# Para agregar fuentes: abrir este archivo en GitHub, tocar el lapiz y sumar una linea a FUENTES.
+
+name: Cosechar y publicar
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  construir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install httpx
+
+      - name: Crear osint.py
+        run: |
+          cat > osint.py <<'FIN_OSINT_PY'
+          #!/usr/bin/env python3
+          """OSINT Argentina, todo en un solo archivo.
+
+          Cosecha los catálogos de datos abiertos del Estado argentino y arma la página y la API de
+          archivos JSON (carpeta site/) para publicar en GitHub Pages. La página está adentro de este código.
+
+          AGREGAR FUENTES: editá este archivo en GitHub (el lápiz) y sumá una línea a FUENTES, más abajo.
+          type "auto" prueba CKAN y después data.json. Al guardar se vuelve a cosechar y publicar solo.
+          USO LOCAL (opcional): python osint.py   |   python osint.py probar   (necesita: pip install httpx)
+
+          REGLAS: se identifica con User-Agent, espera entre pedidos, respeta robots.txt (si un sitio no permite
+          acceso automatizado esa fuente queda "blocked_by_robots"), y una fuente caída no frena a las demás.
+          Si ninguna fuente responde no se publica nada y queda el último sitio bueno.
+          Solo datos públicos y agregados; con datos de personas físicas tené en cuenta la Ley 25.326.
+          """
+          from __future__ import annotations
+
+          import json
+          import re
+          import shutil
+          import sys
+          import tempfile
+          import time
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+          from urllib.robotparser import RobotFileParser
+
+          import httpx
+
+          # ---------------------------------------------------------------------------------------------
+          # FUENTES. Son candidatas: la primera corrida muestra en la página cuáles responden de verdad.
+          # ---------------------------------------------------------------------------------------------
+          FUENTES = [
+              {"id": "nacional", "name": "Datos Argentina (portal nacional, catálogo federado)",
+               "type": "dcat", "url": "https://datos.gob.ar/data.json"},
+              {"id": "caba", "name": "Buenos Aires Data (Ciudad de Buenos Aires)",
+               "type": "auto", "url": "https://data.buenosaires.gob.ar"},
+              {"id": "pba", "name": "Datos Abiertos Provincia de Buenos Aires",
+               "type": "auto", "url": "https://catalogo.datos.gba.gob.ar"},
+              {"id": "mendoza", "name": "Datos Abiertos Mendoza (provincia)",
+               "type": "auto", "url": "https://datosabiertos.mendoza.gov.ar"},
+              {"id": "mendoza-ciudad", "name": "Datos Abiertos Ciudad de Mendoza (URL inferida, sin verificar)",
+               "type": "auto", "url": "https://datos.ciudaddemendoza.gov.ar"},
+          ]
+
+          USER_AGENT = "osint-ar-harvester/0.2 (catalogo de datos abiertos)"
+          ROOT = Path(__file__).resolve().parent
+          CKAN_PAGE = 500
+          PAUSE = 0.5  # segundos entre pedidos a un mismo sitio
+          DESC_MAX = 240
+
+
+          # ---------------------------------------------------------------------------------------------
+          # Cosecha
+          # ---------------------------------------------------------------------------------------------
+          def now_iso() -> str:
+              return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+          def make_client(transport: httpx.BaseTransport | None = None) -> httpx.Client:
+              return httpx.Client(
+                  headers={"User-Agent": USER_AGENT},
+                  timeout=httpx.Timeout(60.0, connect=15.0),
+                  follow_redirects=True,
+                  transport=transport,
+              )
+
+
+          def allowed_by_robots(client: httpx.Client, url: str) -> bool:
+              """True si robots.txt permite consultar la URL (o si no hay robots.txt)."""
+              parts = urlparse(url)
+              try:
+                  r = client.get(f"{parts.scheme}://{parts.netloc}/robots.txt")
+              except httpx.HTTPError:
+                  return True  # sin robots.txt accesible no hay restricción declarada
+              if r.status_code >= 400:
+                  return True
+              rp = RobotFileParser()
+              rp.parse(r.text.splitlines())
+              return rp.can_fetch(USER_AGENT, url)
+
+
+          def _as_list(value) -> list:
+              if value is None:
+                  return []
+              return value if isinstance(value, list) else [value]
+
+
+          def normalize_dcat(source: dict, raw: dict) -> list[dict]:
+              out = []
+              for ds in raw.get("dataset", []):
+                  publisher = ds.get("publisher") or {}
+                  resources = []
+                  for d in _as_list(ds.get("distribution")):
+                      url = d.get("downloadURL") or d.get("accessURL")
+                      if url:
+                          resources.append({"title": d.get("title") or "", "url": url,
+                                            "format": (d.get("format") or "").lower(),
+                                            "modified": d.get("modified") or ""})
+                  ident = ds.get("identifier") or ds.get("title") or ""
+                  out.append({
+                      "id": f"{source['id']}:{ident}", "source": source["id"],
+                      "title": ds.get("title") or "", "description": ds.get("description") or "",
+                      "publisher": publisher.get("name") if isinstance(publisher, dict) else str(publisher),
+                      "themes": _as_list(ds.get("theme")), "modified": ds.get("modified") or "",
+                      "periodicity": ds.get("accrualPeriodicity") or "", "resources": resources,
+                  })
+              return out
+
+
+          def normalize_ckan(source: dict, packages: list[dict]) -> list[dict]:
+              out = []
+              for p in packages:
+                  org = p.get("organization") or {}
+                  resources = [{"title": r.get("name") or "", "url": r.get("url") or "",
+                                "format": (r.get("format") or "").lower(),
+                                "modified": r.get("last_modified") or r.get("created") or ""}
+                               for r in p.get("resources", []) if r.get("url")]
+                  out.append({
+                      "id": f"{source['id']}:{p.get('id') or p.get('name')}", "source": source["id"],
+                      "title": p.get("title") or p.get("name") or "", "description": p.get("notes") or "",
+                      "publisher": org.get("title") or "",
+                      "themes": [t.get("name") for t in p.get("tags", []) if t.get("name")],
+                      "modified": p.get("metadata_modified") or "", "periodicity": "", "resources": resources,
+                  })
+              return out
+
+
+          def harvest_dcat(client: httpx.Client, source: dict) -> list[dict]:
+              r = client.get(source["url"])
+              r.raise_for_status()
+              return normalize_dcat(source, r.json())
+
+
+          def harvest_ckan(client: httpx.Client, source: dict) -> list[dict]:
+              api = urljoin(source["url"].rstrip("/") + "/", "api/3/action/package_search")
+              packages: list[dict] = []
+              start, total = 0, None
+              while total is None or start < total:
+                  r = client.get(api, params={"rows": CKAN_PAGE, "start": start})
+                  r.raise_for_status()
+                  result = r.json()["result"]
+                  total = result["count"]
+                  if not result["results"]:
+                      break
+                  packages.extend(result["results"])
+                  start += len(result["results"])
+                  time.sleep(PAUSE)
+              return normalize_ckan(source, packages)
+
+
+          def harvest_auto(client: httpx.Client, source: dict) -> list[dict]:
+              """Prueba CKAN y, si no es CKAN, el archivo data.json estándar en la raíz del sitio."""
+              base = source["url"].rstrip("/")
+              try:
+                  return harvest_ckan(client, source)
+              except Exception:
+                  return harvest_dcat(client, {**source, "url": base if base.endswith(".json") else base + "/data.json"})
+
+
+          HARVESTERS = {"dcat": harvest_dcat, "ckan": harvest_ckan, "auto": harvest_auto}
+
+
+          def run(sources: list[dict], client: httpx.Client) -> tuple[list[dict], dict]:
+              datasets: list[dict] = []
+              status = {"harvested_at": now_iso(), "sources": {}}
+              for src in sources:
+                  entry = {"name": src.get("name", src["id"]), "url": src["url"], "datasets": 0}
+                  try:
+                      if src["type"] not in HARVESTERS:
+                          raise ValueError(f"tipo de fuente desconocido: {src['type']}")
+                      if not allowed_by_robots(client, src["url"]):
+                          entry["state"] = "blocked_by_robots"
+                      else:
+                          found = HARVESTERS[src["type"]](client, src)
+                          datasets.extend(found)
+                          entry["state"] = "ok"
+                          entry["datasets"] = len(found)
+                  except Exception as exc:  # una fuente caída no frena a las demás
+                      entry["state"] = "error"
+                      entry["error"] = f"{type(exc).__name__}: {exc}"[:300]
+                  status["sources"][src["id"]] = entry
+                  print(f"[{entry['state']}] {src['id']}: {entry['datasets']} datasets", file=sys.stderr)
+              status["total_datasets"] = len(datasets)
+              return datasets, status
+
+
+          # ---------------------------------------------------------------------------------------------
+          # Sitio: página + API de archivos JSON
+          # ---------------------------------------------------------------------------------------------
+          def safe_name(source_id: str) -> str:
+              return re.sub(r"[^a-zA-Z0-9_-]", "_", source_id)
+
+
+          def compact(d: dict) -> dict:
+              return {"id": d["id"], "s": d["source"], "t": d["title"], "d": (d["description"] or "")[:DESC_MAX],
+                      "p": d["publisher"] or "", "f": sorted({r["format"] for r in d["resources"] if r["format"]}),
+                      "n": len(d["resources"]), "m": d["modified"] or ""}
+
+
+          def build_stats(datasets: list[dict], harvested_at: str) -> dict:
+              formats = Counter(r["format"] or "sin-formato" for d in datasets for r in d["resources"])
+              return {
+                  "inventario_cosechado": harvested_at,
+                  "datasets": len(datasets),
+                  "recursos": sum(len(d["resources"]) for d in datasets),
+                  "por_fuente": dict(Counter(d["source"] for d in datasets)),
+                  "por_formato": dict(formats.most_common(25)),
+                  "por_organismo": dict(Counter(d["publisher"] or "sin-dato" for d in datasets).most_common(25)),
+              }
+
+
+          def _dump(path: Path, obj) -> None:
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+
+          def build(datasets: list[dict], status: dict, out_dir: Path) -> dict:
+              """Escribe out_dir/index.html y out_dir/api/*.json."""
+              if out_dir.exists():
+                  shutil.rmtree(out_dir)
+              api, when = out_dir / "api", status["harvested_at"]
+              _dump(api / "status.json", {"inventario_cosechado": when, **status})
+              stats = build_stats(datasets, when)
+              _dump(api / "stats.json", stats)
+              _dump(api / "index.json", {"inventario_cosechado": when, "datasets": [compact(d) for d in datasets]})
+              by_source: dict[str, list] = {}
+              for d in datasets:
+                  by_source.setdefault(d["source"], []).append(d)
+              for sid, items in by_source.items():
+                  _dump(api / "datasets" / f"{safe_name(sid)}.json",
+                        {"inventario_cosechado": when, "source": sid, "datasets": items})
+              (out_dir / "index.html").write_text(PAGINA, encoding="utf-8")
+              (out_dir / ".nojekyll").write_text("", encoding="utf-8")
+              return stats
+
+
+          def main(salida=None, datos=None, fuentes=None, client=None) -> int:
+              salida = Path(salida or ROOT / "site")
+              datos = Path(datos or ROOT / "data")
+              with (client or make_client()) as c:
+                  datasets, status = run(fuentes or FUENTES, c)
+              datos.mkdir(parents=True, exist_ok=True)
+              (datos / "status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+              if not datasets:
+                  # Nunca publicamos un sitio vacío: se falla la corrida y queda el último sitio bueno.
+                  print("Ninguna fuente devolvió datasets: no se publica nada.", file=sys.stderr)
+                  return 1
+              stats = build(datasets, status, salida)
+              print(f"Sitio armado en {salida}: {stats['datasets']} datasets, {stats['recursos']} recursos.", file=sys.stderr)
+              return 0
+
+
+          # ---------------------------------------------------------------------------------------------
+          # Pruebas: python osint.py probar  (sin red, con respuestas simuladas)
+          # ---------------------------------------------------------------------------------------------
+          def probar() -> int:
+              global PAUSE
+              PAUSE = 0
+              dcat = {"dataset": [
+                  {"identifier": "d1", "title": "Inflación mensual", "description": "x" * 500,
+                   "publisher": {"name": "INDEC"}, "theme": ["economia"], "modified": "2026-09-01",
+                   "accrualPeriodicity": "R/P1M",
+                   "distribution": [{"title": "a", "downloadURL": "https://x.test/a.csv", "format": "CSV"},
+                                    {"title": "b", "downloadURL": "https://x.test/b.xlsx", "format": "XLSX"}]},
+                  {"identifier": "d2", "title": "Sin recursos", "publisher": {"name": "X"}, "distribution": []},
+              ]}
+              ckan = {"result": {"count": 2, "results": [
+                  {"id": "a", "title": "Arbolado", "notes": "calles", "organization": {"title": "GCBA"},
+                   "tags": [{"name": "ambiente"}], "metadata_modified": "2026-08-01",
+                   "resources": [{"name": "r", "url": "https://c.test/a.csv", "format": "CSV"}]},
+                  {"id": "b", "title": "Bicis", "organization": {"title": "GCBA"}, "tags": [], "resources": []}]}}
+
+              def h(request: httpx.Request) -> httpx.Response:
+                  u = str(request.url)
+                  if u.endswith("/robots.txt"):
+                      return httpx.Response(200, text="User-agent: *\nDisallow: /") if "bloqueado.test" in u else httpx.Response(404)
+                  if u.startswith("https://nac.test/data.json") or u == "https://solo-dcat.test/data.json":
+                      return httpx.Response(200, json=dcat)
+                  if "ckan.test/api/3/action/package_search" in u:
+                      return httpx.Response(200, json=ckan)
+                  return httpx.Response(500) if "roto.test" in u else httpx.Response(404)
+
+              def cliente():
+                  return make_client(httpx.MockTransport(h))
+
+              n = 0
+              # 1) estados mezclados: ok, ok, bloqueada por robots, error
+              fuentes = [
+                  {"id": "nac", "name": "Nac", "type": "dcat", "url": "https://nac.test/data.json"},
+                  {"id": "ck/raro", "name": "CK", "type": "ckan", "url": "https://ckan.test"},
+                  {"id": "blk", "name": "B", "type": "dcat", "url": "https://bloqueado.test/data.json"},
+                  {"id": "rot", "name": "R", "type": "dcat", "url": "https://roto.test/data.json"},
+              ]
+              with cliente() as c:
+                  datasets, status = run(fuentes, c)
+              estados = {k: v["state"] for k, v in status["sources"].items()}
+              assert estados == {"nac": "ok", "ck/raro": "ok", "blk": "blocked_by_robots", "rot": "error"}, estados
+              assert len(datasets) == 4 and status["total_datasets"] == 4
+              n += 1
+              # 2) tipo auto cae a data.json cuando no es CKAN
+              with cliente() as c:
+                  ds, st = run([{"id": "x", "name": "X", "type": "auto", "url": "https://solo-dcat.test"}], c)
+              assert st["sources"]["x"]["state"] == "ok" and len(ds) == 2
+              n += 1
+              # 3) armado del sitio
+              with tempfile.TemporaryDirectory() as tmp:
+                  out = Path(tmp) / "site"
+                  stats = build(datasets, status, out)
+                  assert stats["datasets"] == 4 and stats["por_formato"]["csv"] == 2 and stats["por_formato"]["xlsx"] == 1
+                  idx = json.loads((out / "api" / "index.json").read_text(encoding="utf-8"))["datasets"]
+                  d1 = next(d for d in idx if d["id"] == "nac:d1")
+                  assert d1["f"] == ["csv", "xlsx"] and len(d1["d"]) == DESC_MAX and d1["n"] == 2
+                  assert (out / "api" / "datasets" / "ck_raro.json").exists()  # nombre de archivo seguro
+                  assert (out / "index.html").read_text(encoding="utf-8").startswith("<!doctype html>")
+                  assert (out / ".nojekyll").exists()
+              n += 1
+              # 4) si ninguna fuente responde: falla y no publica
+              with tempfile.TemporaryDirectory() as tmp:
+                  rc = main(salida=Path(tmp) / "site", datos=Path(tmp) / "data",
+                            fuentes=[fuentes[3]], client=cliente())
+                  assert rc == 1 and not (Path(tmp) / "site").exists() and (Path(tmp) / "data" / "status.json").exists()
+              n += 1
+              print(f"OK: {n} pruebas")
+              return 0
+
+
+          # ---------------------------------------------------------------------------------------------
+          # La página (HTML puro, estilo web de los 2000)
+          # ---------------------------------------------------------------------------------------------
+          PAGINA = r'''<!doctype html>
+          <html lang="es">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>OSINT Argentina - Datos abiertos del Estado</title>
+          <style>
+            /* Solo dos colores, para clasificar: verde = funciona, rojo = falla. Todo lo demás es el estilo por defecto del navegador. */
+            .ok  { color: green; }
+            .mal { color: red; }
+          </style>
+          </head>
+          <body>
+
+          <center>
+          <h1>OSINT ARGENTINA</h1>
+          </center>
+          <hr>
+
+          <p align="center">
+          [ <a href="#que">Qu&eacute; es esto</a> ]
+          [ <a href="#fuentes">Fuentes</a> ]
+          [ <a href="#buscar">Buscar datasets</a> ]
+          </p>
+          <hr>
+
+          <h2><a name="que"></a>Qu&eacute; es esto</h2>
+          <p>
+          Una p&aacute;gina que junta los cat&aacute;logos de datos abiertos de ministerios, secretar&iacute;as, provincias y municipios
+          en un inventario &uacute;nico y permite buscarlos.
+          </p>
+          <p>
+          <b>Estado del inventario:</b> <span id="fresh">cargando...</span>
+          </p>
+          <table border="1" cellpadding="6" cellspacing="0" id="stats">
+          </table>
+
+          <hr>
+          <h2><a name="fuentes"></a>Fuentes</h2>
+          <p>
+          <span class="ok">Verde</span> = el cat&aacute;logo respondi&oacute;.
+          <span class="mal">Rojo</span> = no respondi&oacute;, dio error o no permite acceso automatizado.
+          </p>
+          <table border="1" cellpadding="6" cellspacing="0" id="sources">
+          </table>
+
+          <hr>
+          <h2><a name="buscar"></a>Buscar datasets</h2>
+          <form onsubmit="return false">
+          Palabras: <input type="text" id="q" size="30">
+          Formato: <select id="fmt"><option value="">(todos)</option></select>
+          Fuente: <select id="src"><option value="">(todas)</option></select>
+          <input type="button" id="searchBtn" value="Buscar">
+          </form>
+          <p id="count"></p>
+          <div id="results"></div>
+
+          <hr>
+          <p align="center"><small>
+          El inventario se actualiza solo cada 6 horas.
+          </small></p>
+
+          <script>
+          "use strict";
+          const $ = (id) => document.getElementById(id);
+          const el = (tag, props = {}, ...kids) => {
+            const n = Object.assign(document.createElement(tag), props);
+            kids.forEach((k) => n.append(k));
+            return n;
+          };
+          const row = (cells, header) => el("tr", {}, ...cells.map((c) => el(header ? "th" : "td", {}, c)));
+          const safeUrl = (u) => /^https?:\/\//i.test(u || "") ? u : null;
+          const safeName = (s) => s.replace(/[^a-zA-Z0-9_-]/g, "_");
+          const num = (n) => n.toLocaleString("es-AR");
+          const fetchJson = async (url) => {
+            const r = await fetch(url);
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          };
+
+          let INDEX = [];
+          const fullCache = {};
+
+          async function init() {
+            try {
+              const [status, stats] = await Promise.all([fetchJson("api/status.json"), fetchJson("api/stats.json")]);
+              $("fresh").textContent = "cosechado el " + new Date(status.inventario_cosechado).toLocaleString("es-AR");
+              $("stats").append(
+                row(["Datasets", num(stats.datasets)]),
+                row(["Recursos (archivos y enlaces)", num(stats.recursos)]),
+                row(["Fuentes con datos", num(Object.keys(stats.por_fuente).length)]));
+              $("sources").append(row(["Fuente", "Estado", "Datasets"], true));
+              Object.values(status.sources).forEach((s) => {
+                const ok = s.state === "ok";
+                $("sources").append(row([
+                  s.name,
+                  el("span", { className: ok ? "ok" : "mal", textContent: ok ? "OK" : s.state + (s.error ? " (" + s.error + ")" : "") }),
+                  num(s.datasets)]));
+              });
+              Object.keys(stats.por_formato).forEach((f) => $("fmt").append(el("option", { value: f, textContent: f })));
+              Object.keys(stats.por_fuente).forEach((s) => $("src").append(el("option", { value: s, textContent: s })));
+              INDEX = (await fetchJson("api/index.json")).datasets;
+              render();
+            } catch (e) {
+              $("fresh").className = "mal";
+              $("fresh").textContent = "todavía no hay inventario publicado (" + e.message + ")";
+            }
+          }
+
+          function render() {
+            const terms = $("q").value.toLowerCase().split(/\s+/).filter(Boolean);
+            const fmt = $("fmt").value, src = $("src").value;
+            const hits = INDEX.filter((d) =>
+              (!fmt || d.f.includes(fmt)) && (!src || d.s === src) &&
+              terms.every((t) => (d.t + " " + d.d + " " + d.p).toLowerCase().includes(t)));
+            $("count").textContent = num(hits.length) + " resultados" + (hits.length > 50 ? " (se muestran los primeros 50)" : "");
+            const box = $("results");
+            box.replaceChildren();
+            if (!hits.length) return;
+            const table = el("table", { border: 1, cellPadding: 6, cellSpacing: 0 }, row(["Dataset", "Organismo", "Formatos", "Modificado", "Recursos"], true));
+            hits.slice(0, 50).forEach((d) => {
+              const det = el("details", {}, el("summary", { textContent: d.n + " recurso(s)" }));
+              det.addEventListener("toggle", async () => {
+                if (!det.open || det.dataset.loaded) return;
+                det.dataset.loaded = "1";
+                try {
+                  if (!fullCache[d.s]) fullCache[d.s] = (await fetchJson("api/datasets/" + safeName(d.s) + ".json")).datasets;
+                  const full = fullCache[d.s].find((x) => x.id === d.id);
+                  const ul = el("ul");
+                  (full ? full.resources : []).forEach((r) => {
+                    const href = safeUrl(r.url);
+                    ul.append(el("li", {}, href ? el("a", { href, textContent: r.title || r.url, target: "_blank", rel: "noopener noreferrer" })
+                      : (r.title || "recurso sin enlace válido"), r.format ? " [" + r.format + "]" : ""));
+                  });
+                  det.append(ul);
+                } catch (e) { det.append(el("p", { className: "mal", textContent: "No se pudo cargar: " + e.message })); }
+              });
+              table.append(row([
+                el("span", {}, el("b", { textContent: d.t || "(sin título)" }), el("br"), el("small", { textContent: d.d })),
+                d.p, d.f.join(", "), d.m.slice(0, 10), det]));
+            });
+            box.append(table);
+          }
+          ["q", "fmt", "src"].forEach((id) => $(id).addEventListener("input", render));
+          $("searchBtn").addEventListener("click", render);
+
+          init();
+          </script>
+          </body>
+          </html>
+          '''
+
+
+          if __name__ == "__main__":
+              raise SystemExit(probar() if sys.argv[1:] == ["probar"] else main())
+          FIN_OSINT_PY
+
+      - name: Pruebas
+        run: python osint.py probar
+
+      - name: Cosechar y armar el sitio
+        run: python osint.py
+
+      - name: Guardar estado por fuente (tambien si fallo)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: status
+          path: data/status.json
+          if-no-files-found: ignore
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  publicar:
+    needs: construir
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
