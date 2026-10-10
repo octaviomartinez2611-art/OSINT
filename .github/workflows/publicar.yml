@@ -90,9 +90,17 @@ jobs:
                "type": "auto", "url": "https://datosabiertos.mendoza.gov.ar"},
               {"id": "mendoza-ciudad", "name": "Datos Abiertos Ciudad de Mendoza (URL inferida, sin verificar)",
                "type": "auto", "url": "https://datos.ciudaddemendoza.gov.ar"},
+              {"id": "produccion", "name": "Datos Producción (nodo de ministerio, URL sin verificar)",
+               "type": "auto", "url": "https://datos.produccion.gob.ar"},
+              {"id": "energia", "name": "Datos Energía (nodo de ministerio, URL sin verificar)",
+               "type": "auto", "url": "https://datos.energia.gob.ar"},
+              {"id": "salud", "name": "Datos Salud (nodo de ministerio, URL sin verificar)",
+               "type": "auto", "url": "https://datos.salud.gob.ar"},
+              {"id": "cultura", "name": "Datos Cultura (nodo de ministerio, URL sin verificar)",
+               "type": "auto", "url": "https://datos.cultura.gob.ar"},
           ]
 
-          USER_AGENT = "osint-ar-harvester/0.3 (catalogo de datos abiertos)"
+          USER_AGENT = "osint-ar-harvester/0.4 (catalogo de datos abiertos)"
           ROOT = Path(__file__).resolve().parent
           CKAN_PAGE = 500
           PAUSE = 0.5  # segundos entre pedidos a un mismo sitio
@@ -215,13 +223,31 @@ jobs:
               return normalize_ckan(source, packages)
 
 
+          class FuenteSinCatalogo(Exception):
+              """No se encontró un catálogo legible (ni CKAN ni data.json)."""
+
+
+          def _corto(exc: Exception) -> str:
+              if isinstance(exc, httpx.HTTPStatusError):
+                  return f"HTTP {exc.response.status_code}"
+              return type(exc).__name__
+
+
           def harvest_auto(client: httpx.Client, source: dict) -> list[dict]:
-              """Prueba CKAN y, si no es CKAN, el archivo data.json estándar en la raíz del sitio."""
+              """Prueba CKAN y, si no se puede, el archivo data.json estándar en la raíz del sitio."""
               base = source["url"].rstrip("/")
+              dcat_url = base if base.endswith(".json") else base + "/data.json"
               try:
                   return harvest_ckan(client, source)
-              except Exception:
-                  return harvest_dcat(client, {**source, "url": base if base.endswith(".json") else base + "/data.json"})
+              except Exception as ckan_exc:
+                  try:
+                      return harvest_dcat(client, {**source, "url": dcat_url})
+                  except RobotsBlocked:
+                      raise
+                  except Exception as dcat_exc:
+                      if isinstance(ckan_exc, RobotsBlocked):
+                          raise RobotsBlocked(f"{ckan_exc} (y {dcat_url} no respondió: {_corto(dcat_exc)})")
+                      raise FuenteSinCatalogo(f"CKAN: {_corto(ckan_exc)}; data.json: {_corto(dcat_exc)}")
 
 
           HARVESTERS = {"dcat": harvest_dcat, "ckan": harvest_ckan, "auto": harvest_auto}
@@ -346,7 +372,7 @@ jobs:
                   if u.endswith("/robots.txt"):
                       if "bloqueado.test" in u:
                           return httpx.Response(200, text="User-agent: *\nDisallow: /")
-                      if "soloapi.test" in u:
+                      if "soloapi.test" in u or "sinnada.test" in u:
                           return httpx.Response(200, text="User-agent: *\nDisallow: /api/")
                       return httpx.Response(404)
                   if u.startswith("https://nac.test/data.json") or u in ("https://solo-dcat.test/data.json", "https://soloapi.test/data.json"):
@@ -383,6 +409,14 @@ jobs:
                                 {"id": "b", "name": "B", "type": "ckan", "url": "https://soloapi.test"}], c)
               assert st["sources"]["a"]["state"] == "ok" and len(ds) == 2, st
               assert st["sources"]["b"]["state"] == "blocked_by_robots" and "/api/" in st["sources"]["b"]["error"], st
+              n += 1
+              # 2c) CKAN bloqueado por robots y sin data.json: explica la causa; sin nada de nada: error claro
+              with cliente() as c:
+                  ds, st = run([{"id": "d", "name": "D", "type": "auto", "url": "https://sinnada.test"},
+                                {"id": "e", "name": "E", "type": "auto", "url": "https://roto.test"}], c)
+              assert st["sources"]["d"]["state"] == "blocked_by_robots", st
+              assert "data.json no respondió: HTTP 404" in st["sources"]["d"]["error"], st
+              assert st["sources"]["e"]["state"] == "error" and "FuenteSinCatalogo" in st["sources"]["e"]["error"], st
               n += 1
               # 3) armado del sitio
               with tempfile.TemporaryDirectory() as tmp:
